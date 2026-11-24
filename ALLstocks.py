@@ -1,91 +1,131 @@
+import io
 import pandas as pd
 import requests
 import streamlit as st
+import yfinance as yf
 
-st.set_page_config(page_title="NSE Market Scanner (No API Key)", layout="wide")
-st.title("📊 Live NSE Market Scanner (Free / No Login Required)")
+st.set_page_config(page_title="All NSE Stocks Scanner", layout="wide")
+st.title("📈 All NSE Stocks Scanner (Streamlit Edition)")
 
 
-@st.cache_data(ttl=300, show_spinner="Fetching live NSE equity data...")
-def fetch_nse_all_stocks():
-    """Fetches live NSE equity data including 52-week high/low directly from NSE public feed."""
-    session = requests.Session()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.nseindia.com/market-data/live-equity-market",
-    }
-
+@st.cache_data(ttl=86400, show_spinner="Loading official NSE stock list...")
+def get_all_nse_symbols():
+    """Downloads the official list of all ~2,000+ NSE EQ stocks."""
+    url = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        # 1. Initialize session cookies from NSE homepage
-        session.get("https://www.nseindia.com", headers=headers, timeout=10)
-
-        # 2. Fetch NIFTY TOTAL MARKET (covers top ~750 NSE stocks with 52W High/Low)
-        url = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20TOTAL%20MARKET"
-        resp = session.get(url, headers=headers, timeout=15)
+        resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
-        data = resp.json().get("data", [])
+        df = pd.read_csv(io.StringIO(resp.text))
+        df.columns = [c.strip() for c in df.columns]
+        df = df[df["SERIES"] == "EQ"].copy()
+        return df[["SYMBOL", "NAME OF COMPANY"]].rename(
+            columns={"SYMBOL": "Symbol", "NAME OF COMPANY": "Company"}
+        )
+    except Exception:
+        # Fallback list of major + smallcap NSE symbols if NSE archive times out
+        fallback = [
+            "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "BHARTIARTL",
+            "ITC", "LT", "HINDUNILVR", "BAJFINANCE", "MARUTI", "TATAMOTORS", "SUNPHARMA",
+            "AXISBANK", "TITAN", "ADANIENT", "NTPC", "ONGC", "POWERGRID", "WIPRO",
+            "ULTRACEMCO", "JSWSTEEL", "TATASTEEL", "M&M", "COALINDIA", "HCLTECH",
+            "ASIANPAINT", "ZOMATO", "SUZLON", "YESBANK", "IDEA", "IRFC", "RVNL",
+            "NHPC", "SJVN", "BEL", "HAL", "TRENT", "VBL", "PNB", "BANKBARODA",
+            "CANBK", "IDFCFIRSTB", "FEDERALBNK", "ASHOKLEY", "BHEL", "SAIL", "NMDC",
+            "AGL", "ALLCARGO", "JPPOWER", "RPOWER", "GTLINFRA", "VODAFONE", "UCOBANK",
+        ]
+        return pd.DataFrame({"Symbol": fallback, "Company": fallback})
 
-        records = []
-        for item in data:
-            symbol = item.get("symbol", "")
-            # Skip index summary row
-            if not symbol or "NIFTY" in symbol:
+
+@st.cache_data(ttl=600, show_spinner="Fetching live & 52-week market data...")
+def fetch_market_snapshot(symbols_df, max_stocks):
+    """Fetches 1-year daily data in batches to compute LTP, % Change, 52W High & 52W Low."""
+    subset = symbols_df.head(max_stocks).copy()
+    name_map = dict(zip(subset["Symbol"], subset["Company"]))
+    tickers = [f"{sym}.NS" for sym in subset["Symbol"]]
+
+    # Batch download 1 year of daily candles (fast, avoids rate limits)
+    raw = yf.download(
+        tickers=tickers,
+        period="1y",
+        interval="1d",
+        group_by="ticker",
+        threads=True,
+        progress=False,
+    )
+
+    records = []
+    for sym in subset["Symbol"]:
+        ticker = f"{sym}.NS"
+        try:
+            df_t = raw[ticker] if len(tickers) > 1 else raw
+            df_t = df_t.dropna(subset=["Close"])
+            if len(df_t) < 2:
                 continue
 
-            ltp = float(item.get("lastPrice", 0))
-            if ltp <= 0:
-                continue
+            ltp = float(df_t["Close"].iloc[-1])
+            prev_close = float(df_t["Close"].iloc[-2])
+            open_p = float(df_t["Open"].iloc[-1])
+            day_high = float(df_t["High"].iloc[-1])
+            day_low = float(df_t["Low"].iloc[-1])
+            volume = int(df_t["Volume"].iloc[-1])
+            avg_vol_10d = float(df_t["Volume"].tail(10).mean())
 
-            pct_change = float(item.get("pChange", 0))
-            high_52w = float(item.get("yearHigh", 0))
-            low_52w = float(item.get("yearLow", 0))
-            volume = int(item.get("totalTradedVolume", 0))
+            high_52w = float(df_t["High"].max())
+            low_52w = float(df_t["Low"].min())
 
-            # Distance from 52W High & 52W Low
-            dist_high_pct = ((high_52w - ltp) / high_52w * 100) if high_52w > 0 else 999
-            dist_low_pct = ((ltp - low_52w) / low_52w * 100) if low_52w > 0 else 999
+            pct_change = ((ltp - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
+            dist_high_pct = ((high_52w - ltp) / high_52w * 100) if high_52w > 0 else 999.0
+            dist_low_pct = ((ltp - low_52w) / low_52w * 100) if low_52w > 0 else 999.0
+            vol_spike = round(volume / avg_vol_10d, 2) if avg_vol_10d > 0 else 0.0
 
             records.append({
-                "Symbol": symbol,
-                "Company": item.get("meta", {}).get("companyName", symbol),
+                "Symbol": sym,
+                "Company": name_map.get(sym, sym),
                 "LTP (₹)": round(ltp, 2),
                 "% Change": round(pct_change, 2),
-                "Open": float(item.get("open", 0)),
-                "Day High": float(item.get("dayHigh", 0)),
-                "Day Low": float(item.get("dayLow", 0)),
-                "Prev Close": float(item.get("previousClose", 0)),
+                "Open": round(open_p, 2),
+                "Day High": round(day_high, 2),
+                "Day Low": round(day_low, 2),
+                "Prev Close": round(prev_close, 2),
                 "52W High": round(high_52w, 2),
                 "52W Low": round(low_52w, 2),
                 "% Below 52W High": round(dist_high_pct, 2),
                 "% Above 52W Low": round(dist_low_pct, 2),
                 "Volume": volume,
+                "Volume Surge (x)": vol_spike,
             })
+        except Exception:
+            continue
 
-        return pd.DataFrame(records)
-
-    except Exception as e:
-        st.error(f"Error connecting to NSE feed: {e}")
-        return pd.DataFrame()
+    return pd.DataFrame(records)
 
 
 # --- Sidebar Controls ---
+all_symbols_df = get_all_nse_symbols()
+
 with st.sidebar:
-    st.header("Scanner Controls")
-    if st.button("🔄 Refresh Live Data"):
+    st.header("Scanner Settings")
+    st.write(f"Total NSE Stocks Available: **{len(all_symbols_df)}**")
+    stock_limit = st.slider(
+        "Number of NSE stocks to load",
+        min_value=100,
+        max_value=min(1000, len(all_symbols_df)),
+        value=300,
+        step=50,
+        help="300 stocks loads in ~10 seconds. Increase up to 1,000 for a wider scan.",
+    )
+    if st.button("🔄 Refresh Data"):
         st.cache_data.clear()
         st.rerun()
-    st.caption("Data Source: NSE India Market Feed (No API key or token needed).")
 
-market_df = fetch_nse_all_stocks()
+market_df = fetch_market_snapshot(all_symbols_df, stock_limit)
 
 if market_df.empty:
-    st.warning("Could not load live NSE data right now (NSE servers may be temporarily blocking cloud IPs). Try refreshing in a minute.")
+    st.error("No stock data returned. Click 'Refresh Data' in the sidebar.")
     st.stop()
 
-# --- 5 Separate Tabs as Requested ---
+# --- 5 Separate Tabs ---
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "1️⃣ All Stocks (Small → High)",
     "2️⃣ Recent 52-Week High",
@@ -95,7 +135,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 with tab1:
-    st.subheader(f"All Stocks Sorted Low to High Price ({len(market_df)} Stocks)")
+    st.subheader(f"All Loaded NSE Stocks Sorted Small to High Price ({len(market_df)} Stocks)")
     st.dataframe(
         market_df.sort_values(by="LTP (₹)", ascending=True),
         use_container_width=True,
@@ -103,18 +143,18 @@ with tab1:
     )
 
 with tab2:
-    st.subheader("Stocks Near / At 52-Week High (Within 3% of 52W High)")
-    recent_high_df = market_df[market_df["% Below 52W High"] <= 3.0].sort_values(
+    st.subheader("Recent 52-Week High Stocks (Within 3% of 52W High)")
+    high_52w_df = market_df[market_df["% Below 52W High"] <= 3.0].sort_values(
         by="% Below 52W High", ascending=True
     )
-    st.dataframe(recent_high_df, use_container_width=True, hide_index=True)
+    st.dataframe(high_52w_df, use_container_width=True, hide_index=True)
 
 with tab3:
-    st.subheader("52-Week Low Stocks with High Demand (Within 5% of 52W Low + High Volume)")
-    near_low_df = market_df[market_df["% Above 52W Low"] <= 5.0].sort_values(
-        by="Volume", ascending=False
+    st.subheader("52-Week Low Stocks in High Demand (Within 5% of 52W Low + High Volume)")
+    low_demand_df = market_df[market_df["% Above 52W Low"] <= 5.0].sort_values(
+        by=["Volume Surge (x)", "Volume"], ascending=[False, False]
     )
-    st.dataframe(near_low_df, use_container_width=True, hide_index=True)
+    st.dataframe(low_demand_df, use_container_width=True, hide_index=True)
 
 with tab4:
     st.subheader("High Moving Ratio — Plus Side (Top Gainers)")
